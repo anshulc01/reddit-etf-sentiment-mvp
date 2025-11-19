@@ -42,11 +42,15 @@ POST_LIMIT = 150
 # Reddit Authentication
 # -----------------------------------------------
 @st.cache_resource
-reddit = praw.Reddit(
+def get_reddit_client():
+    """Returns authenticated Reddit client using full script auth."""
+
+ reddit = praw.Reddit(
     client_id="o6Zs31tEtOrXylN63wLC2Q",         # Your 14-character client ID
     client_secret="WDTefleTeB78pbJv-JXo49YE04tr4w", # Your 27-character client secret
     user_agent="QueensCapstoneETF-sentiment/1.0 by u/CapstoneProject01"        # Your custom user agent string
-)
+check_for_async=False,)
+
     return reddit
 
 
