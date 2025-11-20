@@ -1,30 +1,21 @@
-import os
+import time
 from datetime import datetime, timezone
+import re
+
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
-import praw
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
+import plotly.express as px
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import plotly.express as px
 
-# -----------------------------------------------
-# Streamlit Page Config
-# -----------------------------------------------
-st.set_page_config(
-    page_title="Reddit ETF Sentiment – MVP",
-    layout="wide",
-)
+# =========================================================
+# CONFIG
+# =========================================================
 
-st.title("🧠 Reddit ETF & Industry Sentiment – MVP")
-st.caption("Agentic AI sentiment monitor across key investing subreddits (last 24 hours)")
-
-
-# -----------------------------------------------
-# Config
-# -----------------------------------------------
 SUBREDDITS = [
     "PersonalFinanceCanada",
     "investing",
@@ -33,38 +24,51 @@ SUBREDDITS = [
     "canadianinvestor",
 ]
 
+# Simple investing-related query – used with Reddit's public search.json
 QUERY = "ETF OR ETFs OR stock OR stocks OR fund OR index"
-TIME_FILTER = "day"
-POST_LIMIT = 150
+POST_LIMIT_PER_SUB = 80          # keep modest for speed
+TIME_FILTER = "day"              # last 24h window (approx via sort=new)
 
+# Public JSON endpoints do NOT need auth, but they require a User-Agent
+HEADERS = {
+    "User-Agent": "CapstoneETFSentiment/1.0 (contact: u/CapstoneProject01)"
+}
 
-# -----------------------------------------------
-# Reddit Authentication
-# -----------------------------------------------
-@st.cache_resource
-def get_reddit_client():
-    """Returns authenticated Reddit client using full script auth."""
+# ---------------------------------------------------------
+# Streamlit page config
+# ---------------------------------------------------------
+st.set_page_config(
+    page_title="Reddit ETF & Industry Sentiment – MVP (No OAuth)",
+    layout="wide",
+)
 
-    client_id = st.secrets["REDDIT_CLIENT_ID"]
-    client_secret = st.secrets["REDDIT_CLIENT_SECRET"]
-    user_agent = st.secrets["REDDIT_USER_AGENT"]
-    username = st.secrets["REDDIT_USERNAME"]
-    password = st.secrets["REDDIT_PASSWORD"]
+st.title("🧠 Reddit ETF & Industry Sentiment – MVP")
+st.caption(
+    "Agentic-style sentiment monitor across key investing subreddits "
+    "(using Reddit's public JSON endpoints; no OAuth required)."
+)
 
-    reddit = praw.Reddit(
-        client_id=client_id,
-        client_secret=client_secret,
-        user_agent=user_agent,
-        username=username,
-        password=password,
-        check_for_async=False,
+with st.expander("ℹ️ How this works", expanded=False):
+    st.markdown(
+        """
+        This MVP:
+        - Queries Reddit's public JSON API for a set of investing subreddits
+        - Filters posts with a simple query: `ETF OR ETFs OR stock OR stocks OR fund OR index`
+        - Extracts tickers and rough industry keywords from post titles + bodies
+        - Applies **two sentiment engines**:
+            - **VADER** – rule-based, lexicon sentiment
+            - **FinBERT** – transformer model fine-tuned on financial text
+        - Aggregates sentiment by **ticker** and **industry/theme**
+        
+        Because we use Reddit's public endpoints, we **do not need API keys or OAuth**, which avoids
+        rate-limit / 401 issues on Streamlit Cloud.
+        """
     )
-    return reddit
 
+# =========================================================
+# UTIL: Sentiment resources
+# =========================================================
 
-# -----------------------------------------------
-# Sentiment Engines
-# -----------------------------------------------
 @st.cache_resource
 def get_vader():
     nltk.download("vader_lexicon", quiet=True)
@@ -73,253 +77,441 @@ def get_vader():
 
 @st.cache_resource
 def get_finbert():
-    tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-    model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+    """
+    FinBERT model + tokenizer.
+    NOTE: this is ~400MB; first run will be slower while it downloads.
+    """
+    model_name = "ProsusAI/finbert"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    model.eval()
     return tokenizer, model
 
 
-# -----------------------------------------------
-# Fetch Reddit Data
-# -----------------------------------------------
-@st.cache_data(ttl=86400)  # 24 hours
-def fetch_reddit():
-    reddit = get_reddit_client()
-    rows = []
+# =========================================================
+# FETCH REDDIT DATA – PUBLIC JSON (NO AUTH)
+# =========================================================
+
+def _fetch_subreddit_json(subreddit: str, query: str, limit: int) -> list[dict]:
+    """
+    Fetch posts from a subreddit using Reddit's public JSON API.
+    Uses search.json; no OAuth required.
+    """
+    url = f"https://www.reddit.com/r/{subreddit}/search.json"
+    params = {
+        "q": query,
+        "restrict_sr": 1,
+        "sort": "new",
+        "t": TIME_FILTER,
+        "limit": limit,
+    }
+
+    try:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        if resp.status_code != 200:
+            st.error(
+                f"❌ Error fetching from r/{subreddit}: HTTP {resp.status_code} – "
+                f"{resp.text[:200]}"
+            )
+            return []
+
+        data = resp.json()
+        children = data.get("data", {}).get("children", [])
+        posts = []
+
+        for child in children:
+            d = child.get("data", {})
+            created_utc = d.get("created_utc")
+            created_dt = (
+                datetime.fromtimestamp(created_utc, tz=timezone.utc)
+                if created_utc
+                else None
+            )
+
+            posts.append(
+                {
+                    "id": d.get("id"),
+                    "subreddit": subreddit,
+                    "created_utc": created_utc,
+                    "created_dt": created_dt,
+                    "title": d.get("title") or "",
+                    "body": d.get("selftext") or "",
+                    "score": d.get("score"),
+                    "num_comments": d.get("num_comments"),
+                    "url": f"https://www.reddit.com{d.get('permalink', '')}",
+                }
+            )
+
+        return posts
+
+    except Exception as e:
+        st.error(f"❌ Exception fetching r/{subreddit}: {e}")
+        return []
+
+
+@st.cache_data(ttl=60 * 60 * 24)  # cache for 24h
+def fetch_reddit_data() -> pd.DataFrame:
+    """
+    Fetch posts for all configured subreddits via public JSON.
+    """
+    all_rows: list[dict] = []
 
     for sub in SUBREDDITS:
-        try:
-            subreddit = reddit.subreddit(sub)
-            for post in subreddit.search(
-                QUERY,
-                sort="new",
-                time_filter=TIME_FILTER,
-                limit=POST_LIMIT
-            ):
-                created_dt = datetime.fromtimestamp(post.created_utc, tz=timezone.utc)
+        posts = _fetch_subreddit_json(sub, QUERY, POST_LIMIT_PER_SUB)
+        all_rows.extend(posts)
+        # be polite to Reddit
+        time.sleep(1.0)
 
-                rows.append({
-                    "id": post.id,
-                    "type": "post",
-                    "subreddit": sub,
-                    "created_dt": created_dt,
-                    "title": post.title,
-                    "body": post.selftext or "",
-                    "score": post.score,
-                    "url": f"https://www.reddit.com{post.permalink}"
-                })
+    if not all_rows:
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "subreddit",
+                "created_utc",
+                "created_dt",
+                "title",
+                "body",
+                "score",
+                "num_comments",
+                "url",
+            ]
+        )
 
-                post.comments.replace_more(limit=0)
-                for c in post.comments[:25]:
-                    rows.append({
-                        "id": f"{post.id}_{c.id}",
-                        "type": "comment",
-                        "subreddit": sub,
-                        "created_dt": datetime.fromtimestamp(c.created_utc, tz=timezone.utc),
-                        "title": post.title,
-                        "body": c.body,
-                        "score": c.score,
-                        "url": f"https://www.reddit.com{c.permalink}"
-                    })
-
-        except Exception as e:
-            st.error(f"❌ Error fetching from r/{sub}: {e}")
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame(all_rows)
 
 
-# -----------------------------------------------
-# Apply VADER
-# -----------------------------------------------
-def apply_vader(df):
+# =========================================================
+# SENTIMENT
+# =========================================================
+
+def apply_vader(df: pd.DataFrame) -> pd.DataFrame:
     sia = get_vader()
-    texts = (df["title"] + " " + df["body"]).astype(str)
-    scores = texts.apply(sia.polarity_scores)
-    scores_df = pd.DataFrame(scores.tolist())
-    return pd.concat([df.reset_index(drop=True), scores_df.add_prefix("vader_")], axis=1)
+    texts = (df["title"].fillna("") + " " + df["body"].fillna("")).astype(str)
+    scores = texts.apply(sia.polarity_scores).tolist()
+    scores_df = pd.DataFrame(scores).add_prefix("vader_")
+    return pd.concat([df.reset_index(drop=True), scores_df], axis=1)
 
 
-# -----------------------------------------------
-# Apply FinBERT (sampled to stay fast)
-# -----------------------------------------------
-def apply_finbert(df, max_rows=350):
+def finbert_sentiment(texts: list[str], batch_size: int = 16):
     tokenizer, model = get_finbert()
-    model.eval()
 
-    df = df.copy()
-    texts = (df["title"] + " " + df["body"]).astype(str)
-
-    if len(texts) > max_rows:
-        idx = np.random.choice(len(texts), max_rows, replace=False)
-    else:
-        idx = np.arange(len(texts))
-
-    labels_out = [None] * len(texts)
-    scores_out = [None] * len(texts)
+    all_labels = []
+    all_scores = []
+    label_map = {0: "negative", 1: "neutral", 2: "positive"}
 
     with torch.no_grad():
-        for i in idx:
-            encoding = tokenizer(
-                texts[i],
-                truncation=True,
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i : i + batch_size]
+            enc = tokenizer(
+                chunk,
                 padding=True,
+                truncation=True,
                 max_length=256,
-                return_tensors="pt"
+                return_tensors="pt",
             )
-            logits = model(**encoding).logits
-            probs = torch.softmax(logits, dim=1)
-            label_idx = torch.argmax(probs).item()
-            score = probs[0][label_idx].item()
+            outputs = model(**enc)
+            probs = torch.softmax(outputs.logits, dim=-1)
+            scores, labels = torch.max(probs, dim=-1)
+            labels = labels.cpu().numpy().tolist()
+            scores = scores.cpu().numpy().tolist()
 
-            label_map = {0: "negative", 1: "neutral", 2: "positive"}
-            label = label_map[label_idx]
+            for lab, sc in zip(labels, scores):
+                all_labels.append(label_map[int(lab)])
+                all_scores.append(float(sc))
 
-            labels_out[i] = label
-            scores_out[i] = (-score if label == "negative" else score if label == "positive" else 0.0)
+    numeric = []
+    for label, conf in zip(all_labels, all_scores):
+        if label == "negative":
+            numeric.append(-conf)
+        elif label == "positive":
+            numeric.append(conf)
+        else:
+            numeric.append(0.0)
 
-    df["finbert_label"] = labels_out
-    df["finbert_score"] = scores_out
+    return all_labels, numeric
+
+
+def apply_finbert(df: pd.DataFrame, max_rows: int = 400) -> pd.DataFrame:
+    df = df.copy()
+    texts = (df["title"].fillna("") + " " + df["body"].fillna("")).astype(str)
+
+    if len(texts) == 0:
+        df["finbert_label"] = []
+        df["finbert_score"] = []
+        return df
+
+    # sample for speed if too large
+    if len(texts) > max_rows:
+        idx = np.arange(len(texts))
+        np.random.seed(42)
+        chosen = np.random.choice(idx, size=max_rows, replace=False)
+        mask = np.zeros(len(texts), dtype=bool)
+        mask[chosen] = True
+    else:
+        mask = np.ones(len(texts), dtype=bool)
+
+    labels_all = [None] * len(texts)
+    scores_all = [None] * len(texts)
+
+    subset = texts[mask].tolist()
+    labels, scores = finbert_sentiment(subset)
+    j = 0
+    for i, use in enumerate(mask):
+        if use:
+            labels_all[i] = labels[j]
+            scores_all[i] = scores[j]
+            j += 1
+
+    df["finbert_label"] = labels_all
+    df["finbert_score"] = scores_all
     return df
 
 
-# -----------------------------------------------
-# Extract Tickers
-# -----------------------------------------------
-TICKER_BLACKLIST = {"ETF", "ETFs", "TSX", "CAD", "USD", "PE", "RRSP", "TFSA"}
+# =========================================================
+# TICKERS & INDUSTRIES
+# =========================================================
 
-def extract_tickers(text):
-    import re
-    if not isinstance(text, str):
-        return []
-    candidates = re.findall(r"(?:\$)?\\b[A-Z]{2,5}\\b", text.upper())
-    return [c.replace("$", "") for c in candidates if c.replace("$", "") not in TICKER_BLACKLIST]
-
-
-def explode_tickers(df):
-    df = df.copy()
-    df["tickers"] = (df["title"] + " " + df["body"]).apply(extract_tickers)
-    return df.explode("tickers").dropna(subset=["tickers"])
-
-
-# -----------------------------------------------
-# Industry Tagging
-# -----------------------------------------------
-INDUSTRIES = {
-    "Tech / AI": ["tech", "technology", "ai", "software", "chip", "semiconductor"],
-    "Financials": ["bank", "financial", "insurance", "mortgage"],
-    "Energy": ["oil", "gas", "pipeline", "energy"],
-    "REITs": ["reit", "real estate", "property"],
-    "Materials/Metals": ["gold", "silver", "mining", "metal"],
-    "Crypto": ["bitcoin", "crypto", "ethereum", "btc", "eth"],
+TICKER_BLACKLIST = {
+    "ETF",
+    "ETFS",
+    "TSX",
+    "CAD",
+    "USD",
+    "RRSP",
+    "TFSA",
+    "EPS",
+    "NAV",
+    "PE",
+    "IMO",
 }
 
-def explode_industries(df):
+INDUSTRY_KEYWORDS = {
+    "Tech / AI": ["tech", "technology", "ai", "software", "chip", "semiconductor"],
+    "Financials / Banks": ["bank", "financial", "insurance", "mortgage", "lender"],
+    "Energy": ["oil", "gas", "pipeline", "energy"],
+    "Real Estate / REITs": ["reit", "real estate", "property"],
+    "Gold / Metals": ["gold", "silver", "mining", "metal", "precious"],
+    "Crypto / Blockchain": ["crypto", "bitcoin", "btc", "eth", "ethereum", "blockchain"],
+}
+
+
+def extract_tickers(text: str) -> list[str]:
+    if not isinstance(text, str):
+        return []
+    pattern = r"(?:\$)?\b[A-Z]{2,5}\b"
+    candidates = re.findall(pattern, text.upper())
+    cleaned = []
+    for c in candidates:
+        token = c.replace("$", "")
+        if token in TICKER_BLACKLIST:
+            continue
+        cleaned.append(token)
+    return list(set(cleaned))
+
+
+def explode_tickers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["industries"] = df["body"].str.lower().apply(
-        lambda t: [ind for ind, keywords in INDUSTRIES.items() if any(k in t for k in keywords)]
-    )
-    return df.explode("industries").dropna(subset=["industries"])
+    df["combined"] = (df["title"].fillna("") + " " + df["body"].fillna("")).astype(str)
+    df["tickers"] = df["combined"].apply(extract_tickers)
+    exploded = df.explode("tickers").dropna(subset=["tickers"])
+    return exploded
 
 
-# -----------------------------------------------
-# Load Data
-# -----------------------------------------------
-refresh = st.button("🔁 Force refresh data")
-if refresh:
-    fetch_reddit.clear()
+def tag_industries(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["combined"] = (df["title"].fillna("") + " " + df["body"].fillna("")).astype(str)
+    df["combined_lower"] = df["combined"].str.lower()
 
-with st.spinner("Fetching Reddit data..."):
-    df_raw = fetch_reddit()
+    def find_inds(text: str) -> list[str]:
+        hits = []
+        for label, keywords in INDUSTRY_KEYWORDS.items():
+            for k in keywords:
+                if k in text:
+                    hits.append(label)
+                    break
+        return hits
+
+    df["industries"] = df["combined_lower"].apply(find_inds)
+    exploded = df.explode("industries").dropna(subset=["industries"])
+    return exploded
+
+
+# =========================================================
+# UI – FETCH DATA
+# =========================================================
+
+col_btn, _ = st.columns([1, 3])
+with col_btn:
+    if st.button("🔁 Force refresh data (ignore 24h cache)"):
+        fetch_reddit_data.clear()
+
+with st.spinner("Fetching latest Reddit data from public JSON API..."):
+    df_raw = fetch_reddit_data()
 
 if df_raw.empty:
-    st.warning("❌ No data returned from Reddit. Check authentication.")
+    st.error(
+        "No data returned from Reddit. This can happen if Reddit temporarily rate-limits "
+        "public search. Try again in a few minutes."
+    )
     st.stop()
 
-st.success(f"Loaded {len(df_raw)} posts & comments.")
+st.success(f"Loaded {len(df_raw)} posts from {len(SUBREDDITS)} subreddits.")
 
+# =========================================================
+# APPLY SENTIMENT
+# =========================================================
 
-# -----------------------------------------------
-# Apply Sentiment
-# -----------------------------------------------
-with st.spinner("Applying VADER..."):
+with st.spinner("Running VADER sentiment..."):
     df_vader = apply_vader(df_raw)
 
-with st.spinner("Applying FinBERT..."):
-    df_final = apply_finbert(df_vader)
+with st.spinner("Running FinBERT sentiment (sampled subset)..."):
+    df_sent = apply_finbert(df_vader)
 
+df_sent["date"] = df_sent["created_dt"].dt.date
 
-# -----------------------------------------------
-# Aggregations
-# -----------------------------------------------
-df_tickers = explode_tickers(df_final)
-df_industry = explode_industries(df_final)
+# Tickers & industries
+df_tickers = explode_tickers(df_sent)
+df_inds = tag_industries(df_sent)
 
-# Snapshot
-st.subheader("📊 Snapshot Metrics")
-c1, c2, c3 = st.columns(3)
-c1.metric("Posts + Comments", len(df_final))
-c2.metric("Unique Tickers", df_tickers["tickers"].nunique())
-c3.metric("Industries Tagged", df_industry["industries"].nunique())
+# =========================================================
+# SNAPSHOT METRICS
+# =========================================================
 
+st.subheader("📊 Snapshot")
 
-# -----------------------------------------------
-# Ticker Sentiment
-# -----------------------------------------------
-st.subheader("🏷️ Ticker Sentiment")
+total_posts = len(df_sent)
+unique_tickers = df_tickers["tickers"].nunique() if not df_tickers.empty else 0
+unique_inds = df_inds["industries"].nunique() if not df_inds.empty else 0
+time_span = (
+    f"{df_sent['created_dt'].min().strftime('%Y-%m-%d %H:%M UTC')} → "
+    f"{df_sent['created_dt'].max().strftime('%Y-%m-%d %H:%M UTC')}"
+)
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Total posts", f"{total_posts}")
+c2.metric("Unique tickers", f"{unique_tickers}")
+c3.metric("Industries tagged", f"{unique_inds}")
+c4.metric("Time span", time_span)
+
+# =========================================================
+# TICKER SENTIMENT
+# =========================================================
+
+st.subheader("🏷️ Ticker Sentiment (VADER + FinBERT)")
 
 if df_tickers.empty:
-    st.info("No tickers mentioned.")
+    st.info("No tickers detected in the current data window.")
 else:
-    agg = df_tickers.groupby("tickers").agg(
-        mentions=("id", "count"),
-        vader=("vader_compound", "mean"),
-        finbert=("finbert_score", "mean"),
-    ).reset_index()
+    agg_t = (
+        df_tickers.groupby("tickers")
+        .agg(
+            mentions=("id", "count"),
+            avg_vader=("vader_compound", "mean"),
+            avg_finbert=("finbert_score", "mean"),
+        )
+        .reset_index()
+    )
+    agg_t["overall_sentiment"] = (
+        agg_t["avg_vader"].fillna(0) * 0.5 + agg_t["avg_finbert"].fillna(0) * 0.5
+    )
 
-    agg["overall"] = agg[["vader", "finbert"]].mean(axis=1)
+    top_n = st.slider(
+        "Show top N tickers by mentions", 5, 40, 15, step=5, key="ticker_n"
+    )
+    top = agg_t.sort_values("mentions", ascending=False).head(top_n)
 
-    st.dataframe(agg.sort_values("mentions", ascending=False))
+    st.dataframe(
+        top.style.format(
+            {
+                "mentions": "{:,.0f}",
+                "avg_vader": "{:.3f}",
+                "avg_finbert": "{:.3f}",
+                "overall_sentiment": "{:.3f}",
+            }
+        ),
+        use_container_width=True,
+    )
 
-    fig = px.bar(
-        agg.sort_values("overall"),
-        x="overall",
+    fig_t = px.bar(
+        top.sort_values("overall_sentiment", ascending=True),
+        x="overall_sentiment",
         y="tickers",
-        title="Overall Sentiment by Ticker",
-        orientation="h"
+        orientation="h",
+        title="Overall sentiment by ticker (higher = more positive)",
+        hover_data=["mentions", "avg_vader", "avg_finbert"],
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig_t, use_container_width=True)
 
+# =========================================================
+# INDUSTRY SENTIMENT
+# =========================================================
 
-# -----------------------------------------------
-# Industry Sentiment
-# -----------------------------------------------
-st.subheader("🏭 Industry Sentiment")
+st.subheader("🏭 Industry / Theme Sentiment")
 
-if df_industry.empty:
-    st.info("No industry keywords detected.")
+if df_inds.empty:
+    st.info("No industry/theme keywords detected yet.")
 else:
-    agg2 = df_industry.groupby("industries").agg(
-        mentions=("id", "count"),
-        vader=("vader_compound", "mean"),
-        finbert=("finbert_score", "mean"),
-    ).reset_index()
-
-    agg2["overall"] = agg2[["vader", "finbert"]].mean(axis=1)
-
-    st.dataframe(agg2.sort_values("mentions", ascending=False))
-
-    fig2 = px.bar(
-        agg2.sort_values("overall"),
-        x="overall",
-        y="industries",
-        title="Overall Sentiment by Industry",
-        orientation="h"
+    agg_i = (
+        df_inds.groupby("industries")
+        .agg(
+            mentions=("id", "count"),
+            avg_vader=("vader_compound", "mean"),
+            avg_finbert=("finbert_score", "mean"),
+        )
+        .reset_index()
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    agg_i["overall_sentiment"] = (
+        agg_i["avg_vader"].fillna(0) * 0.5 + agg_i["avg_finbert"].fillna(0) * 0.5
+    )
 
+    st.dataframe(
+        agg_i.style.format(
+            {
+                "mentions": "{:,.0f}",
+                "avg_vader": "{:.3f}",
+                "avg_finbert": "{:.3f}",
+                "overall_sentiment": "{:.3f}",
+            }
+        ),
+        use_container_width=True,
+    )
 
-# -----------------------------------------------
-# Raw Data
-# -----------------------------------------------
-st.subheader("📝 Raw Posts & Comments")
-st.dataframe(df_final, use_container_width=True)
+    fig_i = px.bar(
+        agg_i.sort_values("overall_sentiment", ascending=True),
+        x="overall_sentiment",
+        y="industries",
+        orientation="h",
+        title="Overall sentiment by industry/theme",
+        hover_data=["mentions", "avg_vader", "avg_finbert"],
+    )
+    st.plotly_chart(fig_i, use_container_width=True)
 
+# =========================================================
+# RAW DATA
+# =========================================================
+
+st.subheader("🧾 Underlying Reddit Posts")
+
+with st.expander("Show raw data", expanded=False):
+    st.dataframe(
+        df_sent[
+            [
+                "subreddit",
+                "created_dt",
+                "title",
+                "body",
+                "score",
+                "num_comments",
+                "vader_compound",
+                "finbert_label",
+                "finbert_score",
+                "url",
+            ]
+        ].sort_values("created_dt", ascending=False),
+        use_container_width=True,
+    )
+
+st.caption(
+    "Prototype for research / educational purposes only. Not investment advice. "
+    "Data sourced from Reddit via public JSON endpoints."
+)
